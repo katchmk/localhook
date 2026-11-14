@@ -1,0 +1,22 @@
+services:
+  localhook:
+    # `docker compose up` pulls the published image; `--build` builds from source.
+    image: ghcr.io/katchmk/localhook:latest
+    build: .
+    ports:
+      # Host port; the app listens on 8080 inside the container.
+      - "${PORT:-8080}:8080"
+    volumes:
+      - localhook-data:/data
+    extra_hosts:
+      # Lets the Sender reach services on the host machine (also on Linux).
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+    # environment:
+    #   MAX_BODY_BYTES: "10485760"
+    #   MAX_REQUESTS_PER_ENDPOINT: "500"
+    #   MAX_SENT: "200"
+    #   SEND_TIMEOUT_MS: "30000"
+
+volumes:
+  localhook-data:
