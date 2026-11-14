@@ -14,7 +14,7 @@ A local webhook receiver and sender in one Docker container.
 With the repo checked out:
 
 ```sh
-docker compose up -d            # pulls ghcr.io/katchmk/localhook:latest
+docker compose up -d            # pulls katchmk/localhook:latest
 docker compose up -d --build    # or builds from source
 ```
 
@@ -22,12 +22,12 @@ Without the repo:
 
 ```sh
 docker run -d --name localhook -p 8080:8080 -v localhook-data:/data \
-  --add-host host.docker.internal:host-gateway ghcr.io/katchmk/localhook:latest
+  --add-host host.docker.internal:host-gateway katchmk/localhook:latest
 ```
 
 Open http://localhost:8080. Data is kept in the `localhook-data` volume.
 
-Images are built for `linux/amd64` and `linux/arm64`. Tags: `latest` (main branch), `1.2.3` / `1.2` / `1` (release tags `v1.2.3`), and `sha-<commit>`.
+Images are built for `linux/amd64` and `linux/arm64`. Only a release tag `v1.2.3` builds an image. It gets the tags `1.2.3`, `1.2`, `1`, `latest` and `sha-<commit>`.
 
 Send a webhook:
 

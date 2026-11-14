@@ -1,7 +1,7 @@
 services:
   localhook:
     # `docker compose up` pulls the published image; `--build` builds from source.
-    image: ghcr.io/katchmk/localhook:latest
+    image: katchmk/localhook:latest
     build: .
     ports:
       # Host port; the app listens on 8080 inside the container.
