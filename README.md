@@ -5,6 +5,10 @@ A local webhook receiver and sender in one Docker container.
 - **Receiver**: create endpoints, send any HTTP method to `/hook/<id>/...`, and inspect each request (headers, query, body, raw JSON) live in the browser. Replay a captured request to another URL.
 - **Sender**: send HTTP requests from the server (no CORS limits) and keep a history of responses.
 
+![Receiver: captured requests and request details](docs/receiver.png)
+
+![Sender: request editor and history](docs/sender.png)
+
 ## Run with Docker
 
 With the repo checked out:
