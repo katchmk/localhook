@@ -1,6 +1,28 @@
-import { Clock, Download, FileType, Globe, HardDrive, Network, Repeat, Trash2 } from "lucide-react";
-import { useEffect, useState, type ReactNode } from "react";
-import { api, bodyUrl, hookUrl, type CapturedRequest, type HeaderPair, type SentRequest } from "./api";
+import {
+  Clock,
+  Download,
+  FileType,
+  Forward,
+  Globe,
+  HardDrive,
+  Network,
+  Repeat,
+  Send,
+  ShieldAlert,
+  ShieldCheck,
+  Trash2,
+} from "lucide-react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { multipartBoundary, parseMultipart, type MultipartPart } from "./multipart";
+import {
+  api,
+  bodyUrl,
+  hookUrl,
+  type CapturedRequest,
+  type ForwardResult,
+  type HeaderPair,
+  type SentRequest,
+} from "./api";
 import {
   Button,
   CodeView,
@@ -12,13 +34,27 @@ import {
   MethodBadge,
   parseCookies,
   prettyJson,
+  SCHEME_NAMES,
   StatusBadge,
   Tabs,
+  toCurl,
 } from "./ui";
 
 type Tab = "headers" | "query" | "cookies" | "body" | "raw";
 
-export function RequestDetail({ id, endpointId, onDeleted }: { id: string; endpointId: string; onDeleted: () => void }) {
+
+export function RequestDetail({
+  id,
+  endpointId,
+  forward,
+  onDeleted,
+}: {
+  id: string;
+  endpointId: string;
+  /** From the live summary, because the forward result can arrive after the detail loads. */
+  forward: ForwardResult | null;
+  onDeleted: () => void;
+}) {
   const [req, setReq] = useState<CapturedRequest | null>(null);
   const [tab, setTab] = useState<Tab>("body");
 
@@ -43,6 +79,14 @@ export function RequestDetail({ id, endpointId, onDeleted }: { id: string; endpo
         <MethodBadge method={req.method} large />
         <h2 className="text-lg font-semibold">Request details</h2>
         <div className="ml-auto flex gap-2">
+          <a
+            href={`#/sender/${req.id}`}
+            title="Open in Sender to change and send it"
+            className="inline-flex h-8 items-center gap-2 rounded-md border border-zinc-700 bg-zinc-900 px-3 text-sm font-medium text-zinc-100 hover:bg-zinc-800"
+          >
+            <Send className="size-4" /> Sender
+          </a>
+          <CopyButton text={toCurl({ ...req, url: fullUrl })} label="cURL" />
           <CopyButton text={raw} label="JSON" />
           <Button
             variant="danger"
@@ -81,6 +125,29 @@ export function RequestDetail({ id, endpointId, onDeleted }: { id: string; endpo
             )}
           </Meta>
         </div>
+        {(req.signature || forward) && (
+          <div className="grid gap-4 border-t border-zinc-800 pt-4 md:grid-cols-2">
+            {req.signature && (
+              <Meta icon={req.signature.valid ? <ShieldCheck /> : <ShieldAlert />} label="Signature">
+                <span className={cx("text-sm", req.signature.valid ? "text-emerald-400" : "text-rose-400")}>
+                  {SCHEME_NAMES[req.signature.scheme]}: {req.signature.message}
+                </span>
+              </Meta>
+            )}
+            {forward && (
+              <Meta icon={<Forward />} label="Forwarded">
+                <span className="flex items-center gap-2 text-sm">
+                  <StatusBadge status={forward.status} error={forward.error} />
+                  <span className="truncate font-mono text-zinc-300" title={forward.url}>
+                    {forward.url}
+                  </span>
+                  <span className="shrink-0 text-zinc-500">{forward.durationMs} ms</span>
+                </span>
+                {forward.error && <span className="font-mono text-xs text-rose-400">{forward.error}</span>}
+              </Meta>
+            )}
+          </div>
+        )}
       </div>
 
       <Replay requestId={req.id} />
@@ -121,12 +188,113 @@ function Meta({ icon, label, children }: { icon: ReactNode; label: string; child
 
 function Body({ req }: { req: CapturedRequest }) {
   if (req.size === 0) return <p className="p-4 text-sm text-zinc-500 italic">Empty body.</p>;
+  const boundary = multipartBoundary(req.contentType);
+  if (boundary) return <MultipartBody req={req} boundary={boundary} />;
   if (req.bodyEncoding === "base64") return <BinaryBody req={req} />;
   if (req.contentType?.includes("application/x-www-form-urlencoded")) {
     return <KeyValueTable rows={[...new URLSearchParams(req.body).entries()]} empty="No form fields." />;
   }
   const pretty = prettyJson(req.body);
   return <CodeView value={pretty ?? req.body} language={pretty ? "json" : "text"} />;
+}
+
+const bodyBytes = (req: CapturedRequest) =>
+  req.bodyEncoding === "base64"
+    ? Uint8Array.from(atob(req.body), (c) => c.charCodeAt(0))
+    : new TextEncoder().encode(req.body);
+
+/** The part's text, or null when it is a file or not valid UTF-8. */
+function partText(part: MultipartPart): string | null {
+  if (part.filename !== null) return null;
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(part.data);
+  } catch {
+    return null;
+  }
+}
+
+function downloadPart(part: MultipartPart, index: number) {
+  const url = URL.createObjectURL(new Blob([part.data as Uint8Array<ArrayBuffer>], { type: part.contentType ?? "application/octet-stream" }));
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = part.filename || part.name || `part-${index + 1}`;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function MultipartBody({ req, boundary }: { req: CapturedRequest; boundary: string }) {
+  const [showRaw, setShowRaw] = useState(false);
+  const parsed = useMemo(() => {
+    try {
+      return parseMultipart(bodyBytes(req), boundary);
+    } catch (e) {
+      return String(e);
+    }
+  }, [req, boundary]);
+
+  const raw =
+    req.bodyEncoding === "base64" ? <BinaryBody req={req} /> : <CodeView value={req.body} language="text" />;
+  if (typeof parsed === "string") {
+    return (
+      <div className="flex flex-col gap-3">
+        <p className="text-sm text-amber-400">Cannot read the multipart body: {parsed}</p>
+        {raw}
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex flex-col gap-3">
+      <div className="flex items-center gap-3">
+        <span className="text-sm text-zinc-400">
+          {parsed.length} part{parsed.length === 1 ? "" : "s"}
+        </span>
+        <Button size="sm" variant="ghost" className="ml-auto" onClick={() => setShowRaw((v) => !v)}>
+          {showRaw ? "Show parts" : "Show raw"}
+        </Button>
+      </div>
+      {showRaw ? (
+        raw
+      ) : (
+        <div className="overflow-hidden rounded-lg border border-zinc-800">
+          <table className="w-full text-left font-mono text-[13px]">
+            <thead className="bg-zinc-900 text-xs text-zinc-400">
+              <tr>
+                <th className="w-1/4 px-4 py-2 font-medium">Name</th>
+                <th className="px-4 py-2 font-medium">Value</th>
+              </tr>
+            </thead>
+            <tbody>
+              {parsed.map((part, i) => {
+                const text = partText(part);
+                return (
+                  <tr key={i} className="border-t border-zinc-800/70 align-top">
+                    <td className="px-4 py-2 text-zinc-400">{part.name ?? <span className="italic">none</span>}</td>
+                    <td className="px-4 py-2 text-zinc-100">
+                      {text !== null ? (
+                        <span className="break-all whitespace-pre-wrap">{text}</span>
+                      ) : (
+                        <span className="flex flex-wrap items-center gap-3">
+                          <span className="break-all">{part.filename || "Binary value"}</span>
+                          <span className="text-zinc-500">
+                            {formatBytes(part.data.length)}
+                            {part.contentType && `, ${part.contentType}`}
+                          </span>
+                          <Button size="sm" variant="ghost" onClick={() => downloadPart(part, i)}>
+                            <Download className="size-4" /> Download
+                          </Button>
+                        </span>
+                      )}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
 }
 
 function BinaryBody({ req }: { req: CapturedRequest }) {

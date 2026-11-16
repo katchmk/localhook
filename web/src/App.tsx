@@ -15,10 +15,10 @@ function GitHubIcon({ className }: { className?: string }) {
   );
 }
 
-// Routes: #/receiver/<endpointId> and #/sender
+// Routes: #/receiver/<endpointId>, #/sender and #/sender/<capturedRequestId>
 function parseHash() {
   const [, view, id] = window.location.hash.split("/");
-  return { view: view === "sender" ? "sender" : "receiver", endpointId: id ?? null } as const;
+  return { view: view === "sender" ? "sender" : "receiver", id: id || null } as const;
 }
 
 export function App() {
@@ -72,7 +72,11 @@ export function App() {
         </div>
       </header>
       <main className="min-h-0 flex-1 p-4 md:p-6">
-        {route.view === "sender" ? <Sender /> : <Receiver endpointId={route.endpointId} />}
+        {route.view === "sender" ? (
+          <Sender key={route.id} fromRequestId={route.id} />
+        ) : (
+          <Receiver endpointId={route.id} />
+        )}
       </main>
     </div>
   );

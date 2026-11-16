@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { createHmac } from "node:crypto";
 import { createApp } from "./app";
 import { openStore, type Store } from "./db";
 import { createHub } from "./hub";
@@ -176,5 +177,366 @@ describe("sender", () => {
     ).json()) as SentRequest;
     expect(sent.status).toBeNull();
     expect(sent.error).toBeTruthy();
+  });
+});
+
+const patch = (id: string, body: unknown) =>
+  app.request(`/api/endpoints/${id}`, { method: "PATCH", body: JSON.stringify(body) });
+
+const listRequests = async (query = "") =>
+  (await (await app.request(`/api/endpoints/test/requests${query}`)).json()) as CapturedRequestSummary[];
+
+const getRequest = async (id: string) => (await (await app.request(`/api/requests/${id}`)).json()) as CapturedRequest;
+
+describe("response rules", () => {
+  test("uses the first matching rule, else the default response", async () => {
+    await createEndpoint();
+    const res = await patch("test", {
+      responseRules: [
+        { method: "post", path: "/orders/*", status: 500, contentType: "text/plain", body: "boom" },
+        { path: "/slow", status: 202, body: "late", delayMs: 50 },
+      ],
+    });
+    expect(res.status).toBe(200);
+
+    const fail = await app.request("/hook/test/orders/1", { method: "POST" });
+    expect(fail.status).toBe(500);
+    expect(await fail.text()).toBe("boom");
+    expect((await app.request("/hook/test/orders/1", { method: "GET" })).status).toBe(200);
+
+    const started = performance.now();
+    const slow = await app.request("/hook/test/slow", { method: "GET" });
+    expect(slow.status).toBe(202);
+    expect(performance.now() - started).toBeGreaterThanOrEqual(45);
+  });
+
+  test("rejects invalid patches", async () => {
+    await createEndpoint();
+    expect((await patch("test", { responseRules: [{ status: 99 }] })).status).toBe(400);
+    expect((await patch("test", { responseDelayMs: -1 })).status).toBe(400);
+    expect((await patch("test", { forwardUrl: "ftp://x" })).status).toBe(400);
+    expect((await patch("test", { signatureScheme: "nope" })).status).toBe(400);
+  });
+});
+
+describe("auto-forward", () => {
+  test("forwards each request with its subpath and query and saves the result", async () => {
+    const server = Bun.serve({ port: 0, fetch: app.fetch });
+    try {
+      await createEndpoint("target");
+      await createEndpoint();
+      await patch("test", { forwardUrl: `http://localhost:${server.port}/hook/target/base?k=v` });
+      await app.request("/hook/test/orders?x=1", { method: "POST", headers: { "x-a": "1" }, body: "hi" });
+
+      let [summary] = await listRequests();
+      for (let i = 0; i < 100 && !summary!.forward; i++) {
+        await Bun.sleep(10);
+        [summary] = await listRequests();
+      }
+      expect(summary!.forward).toMatchObject({ status: 200, error: null });
+      expect(summary!.forward!.url).toBe(`http://localhost:${server.port}/hook/target/base/orders?k=v&x=1`);
+
+      const [forwarded] = (await (await app.request("/api/endpoints/target/requests")).json()) as CapturedRequestSummary[];
+      const full = await getRequest(forwarded!.id);
+      expect(full.path).toBe("/base/orders");
+      expect(full.body).toBe("hi");
+      expect(full.headers).toContainEqual(["x-a", "1"]);
+    } finally {
+      server.stop(true);
+    }
+  });
+});
+
+describe("signatures", () => {
+  const body = '{"event":"ping"}';
+  const hex = (key: string | Buffer, data: string) => createHmac("sha256", key).update(data).digest("hex");
+
+  async function capture(headers: Record<string, string>) {
+    await Bun.sleep(2); // distinct created_at, so the newest request is this one
+    await app.request("/hook/test", { method: "POST", headers, body });
+    const [summary] = await listRequests();
+    return (await getRequest(summary!.id)).signature;
+  }
+
+  test("checks GitHub signatures", async () => {
+    await createEndpoint();
+    await patch("test", { signatureScheme: "github", signatureSecret: "s3cret" });
+    expect(await capture({ "x-hub-signature-256": `sha256=${hex("s3cret", body)}` })).toMatchObject({ valid: true });
+    expect(await capture({ "x-hub-signature-256": `sha256=${hex("wrong", body)}` })).toMatchObject({ valid: false });
+    expect((await capture({}))!.message).toContain("Missing");
+  });
+
+  test("checks Stripe and Standard Webhooks signatures", async () => {
+    await createEndpoint();
+    await patch("test", { signatureScheme: "stripe", signatureSecret: "whsec_abc" });
+    const t = "1700000000";
+    expect(await capture({ "stripe-signature": `t=${t},v1=bad,v1=${hex("whsec_abc", `${t}.${body}`)}` })).toMatchObject({
+      valid: true,
+    });
+
+    const key = Buffer.from("standard-key");
+    await patch("test", { signatureScheme: "standard", signatureSecret: `whsec_${key.toString("base64")}` });
+    const sig = createHmac("sha256", key).update(`msg_1.${t}.${body}`).digest("base64");
+    expect(
+      await capture({ "webhook-id": "msg_1", "webhook-timestamp": t, "webhook-signature": `v1,bad v1,${sig}` }),
+    ).toMatchObject({ valid: true });
+  });
+
+  test("checks a custom header, algorithm and encoding", async () => {
+    await createEndpoint();
+    await patch("test", {
+      signatureScheme: "custom",
+      signatureSecret: "k",
+      signatureCustom: { header: "X-My-Sig", algorithm: "sha1", encoding: "base64" },
+    });
+    const sig = createHmac("sha1", "k").update(body).digest("base64");
+    expect(await capture({ "x-my-sig": sig })).toMatchObject({ valid: true });
+    expect(await capture({ "x-my-sig": `sha1=${sig}` })).toMatchObject({ valid: true });
+    expect(await capture({ "x-my-sig": "nope" })).toMatchObject({ valid: false });
+    expect((await capture({}))!.message).toBe("Missing X-My-Sig header");
+
+    expect((await patch("test", { signatureCustom: { header: "bad header", algorithm: "sha256", encoding: "hex" } })).status).toBe(400);
+    expect((await patch("test", { signatureCustom: { header: "x", algorithm: "md5", encoding: "hex" } })).status).toBe(400);
+  });
+
+  test("returns null without a scheme", async () => {
+    await createEndpoint();
+    expect(await capture({})).toBeNull();
+  });
+});
+
+describe("search", () => {
+  test("filters by method and by text in path, headers and body", async () => {
+    await createEndpoint();
+    await app.request("/hook/test/a", { method: "POST", body: "needle in body" });
+    await app.request("/hook/test/b", { method: "PUT", headers: { "x-tag": "Needle" } });
+    await app.request("/hook/test/needle", { method: "GET" });
+    await app.request("/hook/test/c", { method: "POST", body: "other" });
+
+    expect((await listRequests("?q=needle")).map((r) => r.path).sort()).toEqual(["/a", "/b", "/needle"]);
+    expect((await listRequests("?q=needle&method=post")).map((r) => r.path)).toEqual(["/a"]);
+    expect(await listRequests("?q=50%25_")).toEqual([]);
+  });
+});
+
+describe("import and export", () => {
+  test("imports a JSON export and a HAR export into another endpoint", async () => {
+    await createEndpoint();
+    await createEndpoint("copy");
+    await createEndpoint("har");
+    await app.request("/hook/test/x?y=1", { method: "POST", headers: { "x-a": "1" }, body: "hello" });
+    await app.request("/hook/test/bin", { method: "PUT", body: new Uint8Array([0xff, 0x00]) });
+
+    const exported = await (await app.request("/api/endpoints/test/export")).json();
+    const res = await app.request("/api/endpoints/copy/import", json(exported));
+    expect(await res.json()).toEqual({ imported: 2 });
+
+    const har = await (await app.request("/api/endpoints/test/export?format=har")).json();
+    expect(har.log.entries).toHaveLength(2);
+    await app.request("/api/endpoints/har/import", json(har));
+
+    for (const id of ["copy", "har"]) {
+      const list = (await (await app.request(`/api/endpoints/${id}/requests`)).json()) as CapturedRequestSummary[];
+      const full = await Promise.all(list.map((r) => getRequest(r.id)));
+      const x = full.find((r) => r.path === "/x")!;
+      expect(x).toMatchObject({ method: "POST", query: "?y=1", body: "hello" });
+      expect(x.headers).toContainEqual(["x-a", "1"]);
+      expect(full.find((r) => r.path === "/bin")).toMatchObject({ bodyEncoding: "base64", body: "/wA=" });
+    }
+  });
+
+  test("rejects files it cannot read", async () => {
+    await createEndpoint();
+    expect((await app.request("/api/endpoints/test/import", json({ nope: 1 }))).status).toBe(400);
+    expect((await app.request("/api/endpoints/test/import", json([{ method: "GET" }]))).status).toBe(400);
+  });
+});
+
+describe("auth", () => {
+  test("protects the API but not webhook URLs", async () => {
+    app = createApp(store, createHub(), { ...config, auth: { username: "admin", password: "pw" } });
+    const basic = { authorization: `Basic ${btoa("admin:pw")}` };
+    expect((await app.request("/api/endpoints")).status).toBe(401);
+    const created = await app.request("/api/endpoints", { ...json({ id: "test" }), headers: { ...json({}).headers, ...basic } });
+    expect(created.status).toBe(201);
+    expect((await app.request("/hook/test", { method: "POST" })).status).toBe(200);
+    expect((await app.request("/api/endpoints/test/requests", { headers: basic })).status).toBe(200);
+  });
+});
+
+describe("proxy mode", () => {
+  test("returns the forward target's response, unless a rule matches", async () => {
+    const server = Bun.serve({ port: 0, fetch: app.fetch });
+    try {
+      await createEndpoint("target");
+      await patch("target", { responseStatus: 201, responseBody: "from target", responseContentType: "text/plain" });
+      await createEndpoint();
+      await patch("test", {
+        forwardUrl: `http://localhost:${server.port}/hook/target`,
+        forwardMode: "proxy",
+        responseRules: [{ path: "/local", status: 418, body: "rule" }],
+      });
+
+      const res = await app.request("/hook/test/x", { method: "POST", body: "hi" });
+      expect(res.status).toBe(201);
+      expect(await res.text()).toBe("from target");
+      expect(res.headers.get("content-type")).toBe("text/plain");
+      const [summary] = await listRequests();
+      expect(summary!.forward).toMatchObject({ status: 201 }); // Saved before the response.
+
+      const local = await app.request("/hook/test/local", { method: "POST" });
+      expect(local.status).toBe(418);
+      // A matching rule still forwards in the background; wait so it does not outlive the test.
+      for (let i = 0; i < 100 && (await listRequests()).some((r) => !r.forward); i++) await Bun.sleep(10);
+    } finally {
+      server.stop(true);
+    }
+  });
+
+  test("returns 502 when the forward target cannot be reached", async () => {
+    await createEndpoint();
+    await patch("test", { forwardUrl: "http://127.0.0.1:1/", forwardMode: "proxy" });
+    const res = await app.request("/hook/test", { method: "POST" });
+    expect(res.status).toBe(502);
+    expect(((await res.json()) as { error: string }).error).toStartWith("Forward failed");
+  });
+});
+
+describe("forward loops", () => {
+  test("stop after a fixed number of hops", async () => {
+    const server = Bun.serve({ port: 0, fetch: app.fetch });
+    try {
+      await createEndpoint("a");
+      await createEndpoint("b");
+      await patch("a", { forwardUrl: `http://localhost:${server.port}/hook/b` });
+      await patch("b", { forwardUrl: `http://localhost:${server.port}/hook/a` });
+      await app.request("/hook/a", { method: "POST" });
+
+      const count = async () =>
+        ((await (await app.request("/api/endpoints/a/requests")).json()) as unknown[]).length +
+        ((await (await app.request("/api/endpoints/b/requests")).json()) as unknown[]).length;
+      let last = -1;
+      for (let i = 0; i < 100; i++) {
+        await Bun.sleep(20);
+        const now = await count();
+        if (now === last) break;
+        last = now;
+      }
+      // The first request plus MAX_HOPS forwards.
+      expect(last).toBe(6);
+    } finally {
+      server.stop(true);
+    }
+  });
+});
+
+describe("signature secret", () => {
+  test("is not returned with the endpoint, only on request", async () => {
+    await createEndpoint();
+    await patch("test", { signatureScheme: "github", signatureSecret: "hidden" });
+    const ep = (await (await app.request("/api/endpoints/test")).json()) as Record<string, unknown>;
+    expect(ep.signatureSecretSet).toBe(true);
+    expect(JSON.stringify(ep)).not.toContain("hidden");
+    const list = await (await app.request("/api/endpoints")).text();
+    expect(list).not.toContain("hidden");
+    expect(await (await app.request("/api/endpoints/test/secret")).json()).toEqual({ signatureSecret: "hidden" });
+  });
+});
+
+describe("custom signature payload", () => {
+  test("signs a timestamp header together with the body", async () => {
+    await createEndpoint();
+    await patch("test", {
+      signatureScheme: "custom",
+      signatureSecret: "k",
+      signatureCustom: { header: "X-Sig", algorithm: "sha256", encoding: "hex", payload: "v1:{header:X-Ts}:{body}" },
+    });
+    const sig = createHmac("sha256", "k").update("v1:123:hello").digest("hex");
+    await app.request("/hook/test", { method: "POST", headers: { "x-sig": sig, "x-ts": "123" }, body: "hello" });
+    let [summary] = await listRequests();
+    expect((await getRequest(summary!.id)).signature).toMatchObject({ valid: true });
+
+    await Bun.sleep(2);
+    await app.request("/hook/test", { method: "POST", headers: { "x-sig": sig }, body: "hello" });
+    [summary] = await listRequests();
+    expect((await getRequest(summary!.id)).signature!.message).toBe("Missing X-Ts header");
+  });
+});
+
+describe("signed sends", () => {
+  test("signs outgoing requests so the receiver can verify them", async () => {
+    const server = Bun.serve({ port: 0, fetch: app.fetch });
+    try {
+      await createEndpoint();
+      const custom = { header: "X-Sig", algorithm: "sha512", encoding: "base64", payload: "{header:X-Ts}.{body}" };
+      for (const scheme of ["github", "stripe", "shopify", "slack", "standard", "custom"]) {
+        const secret = scheme === "standard" ? `whsec_${btoa("key")}` : "s3cret";
+        await patch("test", { signatureScheme: scheme, signatureSecret: secret, signatureCustom: custom });
+        await Bun.sleep(2);
+        const sent = (await (
+          await app.request(
+            "/api/send",
+            json({
+              method: "POST",
+              url: `http://localhost:${server.port}/hook/test`,
+              headers: [["X-Ts", "42"]],
+              body: '{"a":1}',
+              sign: { scheme, secret, custom },
+            }),
+          )
+        ).json()) as SentRequest;
+        expect(sent.status).toBe(200);
+        const [summary] = await listRequests();
+        expect({ scheme, ...(await getRequest(summary!.id)).signature }).toMatchObject({ scheme, valid: true });
+      }
+    } finally {
+      server.stop(true);
+    }
+  });
+
+  test("reports a missing payload header", async () => {
+    const res = await app.request(
+      "/api/send",
+      json({
+        url: "http://127.0.0.1:1/",
+        headers: [],
+        body: "",
+        sign: { scheme: "custom", secret: "k", custom: { header: "X-Sig", payload: "{header:X-Ts}" } },
+      }),
+    );
+    expect(res.status).toBe(400);
+  });
+});
+
+describe("saved requests and variables", () => {
+  const request = { method: "post", url: "{{base}}/x", headers: [["A", "1"]], body: "{}", auth: { type: "bearer", token: "t" } };
+
+  test("creates, lists, updates and deletes saved requests", async () => {
+    const created = await app.request("/api/saved", json({ collection: "Shop", name: "Order", request }));
+    expect(created.status).toBe(201);
+    const saved = (await created.json()) as { id: string; request: { method: string; auth: { type: string; in: string } } };
+    expect(saved.request.method).toBe("POST");
+    expect(saved.request.auth).toMatchObject({ type: "bearer", in: "header" });
+
+    await app.request(`/api/saved/${saved.id}`, { method: "PUT", body: JSON.stringify({ name: "Order 2" }) });
+    const list = (await (await app.request("/api/saved")).json()) as { name: string; collection: string }[];
+    expect(list).toMatchObject([{ name: "Order 2", collection: "Shop" }]);
+
+    await app.request(`/api/saved/${saved.id}`, { method: "DELETE" });
+    expect(await (await app.request("/api/saved")).json()).toEqual([]);
+    expect((await app.request("/api/saved", json({ name: "", request }))).status).toBe(400);
+  });
+
+  test("stores variables in order", async () => {
+    const put = (body: unknown) => app.request("/api/variables", { method: "PUT", body: JSON.stringify(body) });
+    expect(await (await put([["base", "http://x"], ["", "dropped"], ["token", "t"]])).json()).toEqual([
+      ["base", "http://x"],
+      ["token", "t"],
+    ]);
+    expect(await (await app.request("/api/variables")).json()).toEqual([
+      ["base", "http://x"],
+      ["token", "t"],
+    ]);
+    expect((await put({ a: 1 })).status).toBe(400);
   });
 });

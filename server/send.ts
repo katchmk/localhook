@@ -23,6 +23,15 @@ export interface OutgoingRequest {
 }
 
 export async function sendRequest(out: OutgoingRequest, timeoutMs: number, maxBodyBytes: number): Promise<SentRequest> {
+  return (await sendRaw(out, timeoutMs, maxBodyBytes)).sent;
+}
+
+/** Like sendRequest, but also returns the raw response body (up to `maxBodyBytes`), e.g. to proxy it. */
+export async function sendRaw(
+  out: OutgoingRequest,
+  timeoutMs: number,
+  maxBodyBytes: number,
+): Promise<{ sent: SentRequest; bytes: Uint8Array<ArrayBuffer> }> {
   const method = out.method.toUpperCase();
   const headers = new Headers();
   for (const [k, v] of out.headers) {
@@ -44,6 +53,7 @@ export async function sendRequest(out: OutgoingRequest, timeoutMs: number, maxBo
     createdAt: Date.now(),
   };
 
+  let raw = new Uint8Array(0);
   const started = performance.now();
   try {
     const res = await fetch(out.url, {
@@ -54,13 +64,14 @@ export async function sendRequest(out: OutgoingRequest, timeoutMs: number, maxBo
       signal: AbortSignal.timeout(timeoutMs),
     });
     const bytes = new Uint8Array(await res.arrayBuffer());
+    raw = bytes.subarray(0, maxBodyBytes);
     result.status = res.status;
     result.responseHeaders = [...res.headers.entries()];
-    result.responseBody = new TextDecoder().decode(bytes.subarray(0, maxBodyBytes));
+    result.responseBody = new TextDecoder().decode(raw);
     if (bytes.byteLength > maxBodyBytes) result.error = `Response body truncated to ${maxBodyBytes} bytes`;
   } catch (err) {
     result.error = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
   }
   result.durationMs = Math.round(performance.now() - started);
-  return result;
+  return { sent: result, bytes: raw };
 }

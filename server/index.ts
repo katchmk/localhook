@@ -10,6 +10,7 @@ const port = env("PORT", 8080);
 const hostname = process.env.HOST || undefined;
 const dataDir = process.env.DATA_DIR ?? "./data";
 const maxBodyBytes = env("MAX_BODY_BYTES", 10 * 1024 * 1024);
+const authPassword = process.env.AUTH_PASSWORD;
 
 mkdirSync(dataDir, { recursive: true });
 const store = openStore(join(dataDir, "localhook.db"));
@@ -20,6 +21,7 @@ const app = createApp(store, createHub(), {
   maxSent: env("MAX_SENT", 200),
   sendTimeoutMs: env("SEND_TIMEOUT_MS", 30_000),
   staticDir: process.env.NODE_ENV === "production" ? (process.env.STATIC_DIR ?? "./dist") : undefined,
+  auth: authPassword ? { username: process.env.AUTH_USERNAME || "admin", password: authPassword } : undefined,
 });
 
 const server = Bun.serve({

@@ -17,6 +17,8 @@ services:
     #   MAX_REQUESTS_PER_ENDPOINT: "500"
     #   MAX_SENT: "200"
     #   SEND_TIMEOUT_MS: "30000"
+    #   AUTH_USERNAME: "admin"
+    #   AUTH_PASSWORD: "change-me"
 
 volumes:
   localhook-data:

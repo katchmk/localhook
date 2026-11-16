@@ -3,7 +3,18 @@
 A local webhook receiver and sender in one Docker container.
 
 - **Receiver**: create endpoints, send any HTTP method to `/hook/<id>/...`, and inspect each request (headers, query, body, raw JSON) live in the browser. Replay a captured request to another URL.
+  - **Auto-forward**: send each captured request to your app as well, with its subpath and query. In **proxy mode**, the sender gets your app's response, so handshakes such as the Slack URL challenge work. Forwards stop after 5 hops (`X-Localhook-Hops` header), so endpoints that forward to each other cannot loop.
+  - **Signature check**: verify GitHub, Stripe, Shopify, Slack and Standard Webhooks (Svix) signatures, or a custom HMAC header (SHA-256, SHA-1 or SHA-512, hex or base64) over a payload such as `{header:X-Timestamp}.{body}`. The API returns the secret only on request.
+  - **Response rules**: return a different status, body or delay for each method and subpath, e.g. to test retries and timeouts.
+  - **Search** by method and by text in the path, headers and body. **Compare** two requests line by line.
+  - **Multipart bodies** show as fields and files, with a download for each file.
+  - **Import and export** as localhook JSON or HAR.
+  - **Copy as cURL**, or open a request in the Sender to change it and send it again.
 - **Sender**: send HTTP requests from the server (no CORS limits) and keep a history of responses.
+  - **Auth**: Basic, Bearer token or API key (header or query).
+  - **Signature**: sign the request like a webhook provider (all schemes above), to test your own signature checks.
+  - **Saved requests** in named collections, and **variables** such as `{{baseUrl}}` or `{{token}}`.
+  - **Import a cURL command** into the editor, or copy the request as cURL.
 
 ![Receiver: captured requests and request details](docs/receiver.png)
 
@@ -49,7 +60,9 @@ Inside the container, `localhost` is the container itself. To send to a service 
 | `MAX_BODY_BYTES` | `10485760` | Maximum captured or response body size |
 | `MAX_REQUESTS_PER_ENDPOINT` | `500` | Older captured requests are deleted |
 | `MAX_SENT` | `200` | Sender history size |
-| `SEND_TIMEOUT_MS` | `30000` | Timeout for sent and replayed requests |
+| `SEND_TIMEOUT_MS` | `30000` | Timeout for sent, replayed and forwarded requests |
+| `AUTH_PASSWORD` | none | Turns on HTTP Basic auth for the UI and API. Webhook URLs (`/hook/...`) stay open |
+| `AUTH_USERNAME` | `admin` | Basic auth user name |
 
 Set variables in the shell or in a `.env` file in the project root (see `.env.example`). Bun, Vite and Docker Compose all read it.
 

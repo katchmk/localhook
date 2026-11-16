@@ -2,9 +2,9 @@ import { json } from "@codemirror/lang-json";
 import { EditorView } from "@codemirror/view";
 import { githubDark } from "@uiw/codemirror-theme-github";
 import CodeMirror from "@uiw/react-codemirror";
-import { Check, Copy } from "lucide-react";
-import { useEffect, useState, type ButtonHTMLAttributes, type ReactNode } from "react";
-import type { HeaderPair } from "./api";
+import { Check, Copy, Plus, X } from "lucide-react";
+import { useEffect, useRef, useState, type ButtonHTMLAttributes, type ReactNode } from "react";
+import { SIGNATURE_ALGORITHMS, type CustomSignature, type HeaderPair, type SignatureScheme } from "./api";
 
 export function cx(...classes: (string | false | null | undefined)[]) {
   return classes.filter(Boolean).join(" ");
@@ -35,6 +35,25 @@ export function Button({
         className,
       )}
     />
+  );
+}
+
+/** Shows `label` below the child on hover or keyboard focus. Faster and styled, unlike `title`. */
+export function Tooltip({ label, children }: { label: string; children: ReactNode }) {
+  return (
+    <span className="group/tip relative inline-flex">
+      {children}
+      <span
+        role="tooltip"
+        className={cx(
+          "pointer-events-none absolute top-full left-1/2 z-20 mt-1.5 -translate-x-1/2 whitespace-nowrap",
+          "rounded-md border border-zinc-700 bg-zinc-800 px-2 py-1 text-xs text-zinc-100 shadow-lg",
+          "opacity-0 transition-opacity delay-0 group-focus-within/tip:opacity-100 group-hover/tip:opacity-100 group-hover/tip:delay-300",
+        )}
+      >
+        {label}
+      </span>
+    </span>
   );
 }
 
@@ -85,6 +104,7 @@ export function CopyButton({ text, label, className }: { text: string; label?: s
       variant={label ? "secondary" : "ghost"}
       size={label ? "sm" : "icon"}
       className={className}
+      type="button"
       title="Copy"
       onClick={async () => {
         await navigator.clipboard.writeText(text);
@@ -112,9 +132,10 @@ export function Tabs<T extends string>({
       {tabs.map((t) => (
         <button
           key={t.id}
+          type="button"
           onClick={() => onChange(t.id)}
           className={cx(
-            "-mb-px flex items-center gap-2 border-b-2 px-3 py-2 text-sm transition-colors",
+            "-mb-px flex shrink-0 items-center gap-2 border-b-2 px-3 py-2 text-sm whitespace-nowrap transition-colors",
             value === t.id ? "border-sky-500 text-sky-400" : "border-transparent text-zinc-400 hover:text-zinc-200",
           )}
         >
@@ -222,12 +243,62 @@ export function Panel({ children, className }: { children: ReactNode; className?
   return <section className={cx("rounded-xl border border-zinc-800 bg-zinc-900/40", className)}>{children}</section>;
 }
 
-export function Field({ label, children }: { label: string; children: ReactNode }) {
-  return (
-    <label className="flex flex-col gap-1.5">
-      <span className="text-xs font-medium tracking-wide text-zinc-400 uppercase">{label}</span>
+/**
+ * A labeled form field. Use `group` for controls made of several buttons: a <label> would
+ * send clicks on its text to the first button.
+ */
+export function Field({
+  label,
+  group,
+  className,
+  children,
+}: {
+  label: string;
+  group?: boolean;
+  className?: string;
+  children: ReactNode;
+}) {
+  const title = <span className="text-xs font-medium tracking-wide text-zinc-400 uppercase">{label}</span>;
+  return group ? (
+    <div role="group" aria-label={label} className={cx("flex flex-col gap-1.5", className)}>
+      {title}
+      {children}
+    </div>
+  ) : (
+    <label className={cx("flex flex-col gap-1.5", className)}>
+      {title}
       {children}
     </label>
+  );
+}
+
+/** A row of buttons where one is selected, e.g. Text / Binary file. */
+export function Segmented<T extends string>({
+  value,
+  options,
+  onChange,
+}: {
+  value: T;
+  options: { value: T; label: string }[];
+  onChange: (value: T) => void;
+}) {
+  return (
+    <div className="flex flex-wrap gap-1 self-start rounded-md border border-zinc-800 p-0.5 text-sm">
+      {options.map((o) => (
+        <button
+          key={o.value}
+          type="button"
+          aria-pressed={value === o.value}
+          onClick={() => onChange(o.value)}
+          className={cx(
+            "rounded px-3 py-1 whitespace-nowrap transition-colors",
+            value === o.value ? "bg-zinc-800 text-zinc-100" : "text-zinc-400 hover:text-zinc-200",
+          )}
+        >
+          {o.label}
+        </button>
+      ))}
+    </div>
   );
 }
 
@@ -265,4 +336,214 @@ export function prettyJson(text: string): string | null {
   } catch {
     return null;
   }
+}
+
+// curl sets these itself, or they describe the original connection.
+const CURL_SKIP = new Set(["host", "content-length", "connection", "transfer-encoding", "accept-encoding"]);
+
+const shellQuote = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
+
+/** A curl command that sends the same request. Binary bodies are piped in from base64. */
+export function toCurl(r: { method: string; url: string; headers: HeaderPair[]; body: string; bodyEncoding?: string }) {
+  const parts = [r.method === "HEAD" ? "curl --head" : `curl -X ${r.method}`, shellQuote(r.url)];
+  for (const [k, v] of r.headers) {
+    if (k.trim() && !CURL_SKIP.has(k.trim().toLowerCase())) parts.push(`-H ${shellQuote(`${k.trim()}: ${v}`)}`);
+  }
+  if (!r.body) return parts.join(" \\\n  ");
+  if (r.bodyEncoding === "base64") {
+    return `printf %s ${shellQuote(r.body)} | base64 -d | ${[...parts, "--data-binary @-"].join(" \\\n  ")}`;
+  }
+  return [...parts, `--data-binary ${shellQuote(r.body)}`].join(" \\\n  ");
+}
+
+export const SCHEME_LABELS: Record<SignatureScheme, string> = {
+  github: "GitHub (X-Hub-Signature-256)",
+  stripe: "Stripe (Stripe-Signature)",
+  shopify: "Shopify (X-Shopify-Hmac-Sha256)",
+  slack: "Slack (X-Slack-Signature)",
+  standard: "Standard Webhooks / Svix (webhook-signature)",
+  custom: "Custom HMAC header",
+};
+
+/** Short names, for buttons and badges. */
+export const SCHEME_NAMES: Record<SignatureScheme, string> = {
+  github: "GitHub",
+  stripe: "Stripe",
+  shopify: "Shopify",
+  slack: "Slack",
+  standard: "Standard Webhooks",
+  custom: "Custom",
+};
+
+const ALGORITHM_NAMES: Record<CustomSignature["algorithm"], string> = {
+  sha256: "SHA-256",
+  sha1: "SHA-1",
+  sha512: "SHA-512",
+};
+
+/** The payload template with its {body} and {header:Name} tokens colored. */
+function PayloadTokens({ payload }: { payload: string }) {
+  return (
+    <>
+      {payload.split(/(\{body\}|\{header:[^}]+\})/g).map((part, i) =>
+        i % 2 === 1 ? (
+          <span key={i} className="text-sky-300">
+            {part}
+          </span>
+        ) : (
+          <span key={i} className="text-zinc-300">
+            {part}
+          </span>
+        ),
+      )}
+    </>
+  );
+}
+
+/**
+ * Header, algorithm, encoding and payload template of a custom HMAC signature.
+ * `mode` changes the help text: "verify" for received requests, "sign" for sent ones.
+ */
+export function CustomSignatureFields({
+  value,
+  onChange,
+  mode,
+}: {
+  value: CustomSignature;
+  onChange: (value: CustomSignature) => void;
+  mode: "verify" | "sign";
+}) {
+  const payloadInput = useRef<HTMLInputElement>(null);
+  // Inserts at the cursor, or at the end when the field has no focus yet.
+  const insert = (token: string) => {
+    const el = payloadInput.current;
+    const start = el?.selectionStart ?? value.payload.length;
+    const end = el?.selectionEnd ?? start;
+    onChange({ ...value, payload: value.payload.slice(0, start) + token + value.payload.slice(end) });
+    requestAnimationFrame(() => {
+      el?.focus();
+      el?.setSelectionRange(start + token.length, start + token.length);
+    });
+  };
+  return (
+    <div className="flex max-w-3xl flex-col gap-4 rounded-lg border border-zinc-800 bg-zinc-950/40 p-4">
+      <div className="flex flex-wrap items-end gap-4">
+        <Field label="Header" className="min-w-40 flex-1">
+          <input
+            className={cx(inputClass, "h-9")}
+            placeholder="X-Signature"
+            value={value.header}
+            onChange={(e) => onChange({ ...value, header: e.target.value })}
+            spellCheck={false}
+          />
+        </Field>
+        <Field label="Algorithm" group>
+          <Segmented
+            value={value.algorithm}
+            options={SIGNATURE_ALGORITHMS.map((a) => ({ value: a, label: ALGORITHM_NAMES[a] }))}
+            onChange={(algorithm) => onChange({ ...value, algorithm })}
+          />
+        </Field>
+        <Field label="Encoding" group>
+          <Segmented
+            value={value.encoding}
+            options={[
+              { value: "hex", label: "Hex" },
+              { value: "base64", label: "Base64" },
+            ]}
+            onChange={(encoding) => onChange({ ...value, encoding })}
+          />
+        </Field>
+      </div>
+
+      <div className="flex flex-col gap-1.5">
+        <Field label="Signed payload">
+          <input
+            ref={payloadInput}
+            className={cx(inputClass, "h-9")}
+            placeholder="{body}"
+            value={value.payload}
+            onChange={(e) => onChange({ ...value, payload: e.target.value })}
+            spellCheck={false}
+          />
+        </Field>
+        <div className="flex flex-wrap items-center gap-1.5 text-xs text-zinc-500">
+          Insert
+          <button
+            type="button"
+            className="rounded border border-zinc-700 px-1.5 py-0.5 font-mono text-sky-300 hover:bg-zinc-800"
+            title="The raw request body"
+            onClick={() => insert("{body}")}
+          >
+            {"{body}"}
+          </button>
+          <button
+            type="button"
+            className="rounded border border-zinc-700 px-1.5 py-0.5 font-mono text-sky-300 hover:bg-zinc-800"
+            title="The value of a request header. Change Name to the header name."
+            onClick={() => insert("{header:Name}")}
+          >
+            {"{header:Name}"}
+          </button>
+        </div>
+      </div>
+
+      <div className="overflow-x-auto rounded-md border border-zinc-800 bg-zinc-950 px-3 py-2 font-mono text-xs whitespace-nowrap text-zinc-500">
+        <span className="text-zinc-300">{value.header || "X-Signature"}</span>: {value.encoding}(HMAC-
+        {ALGORITHM_NAMES[value.algorithm]}(secret, "<PayloadTokens payload={value.payload} />"))
+      </div>
+      {mode === "verify" && (
+        <p className="-mt-2 text-xs text-zinc-500">
+          A <code>{value.algorithm}=</code> prefix on the received signature is allowed.
+        </p>
+      )}
+    </div>
+  );
+}
+
+/** Editable [name, value] rows, e.g. headers, cookies or variables. */
+export function PairEditor({
+  pairs,
+  noun,
+  onChange,
+}: {
+  pairs: HeaderPair[];
+  noun: "header" | "cookie" | "variable";
+  onChange: (p: HeaderPair[]) => void;
+}) {
+  const update = (i: number, pos: 0 | 1, value: string) =>
+    onChange(pairs.map((h, j) => (j === i ? (pos === 0 ? [value, h[1]] : [h[0], value]) : h)));
+  return (
+    <div className="flex flex-col gap-2">
+      {pairs.map(([k, v], i) => (
+        <div key={i} className="flex gap-2">
+          <input
+            className={cx(inputClass, "h-9 w-1/3 min-w-0")}
+            placeholder={noun === "header" ? "Header" : "Name"}
+            value={k}
+            onChange={(e) => update(i, 0, e.target.value)}
+          />
+          <input
+            className={cx(inputClass, "h-9 min-w-0 flex-1")}
+            placeholder="Value"
+            value={v}
+            onChange={(e) => update(i, 1, e.target.value)}
+          />
+          <Button
+            variant="ghost"
+            size="icon"
+            type="button"
+            className="size-9"
+            title={`Remove ${noun}`}
+            onClick={() => onChange(pairs.filter((_, j) => j !== i))}
+          >
+            <X className="size-4" />
+          </Button>
+        </div>
+      ))}
+      <Button size="sm" type="button" className="self-start" onClick={() => onChange([...pairs, ["", ""]])}>
+        <Plus className="size-4" /> Add {noun}
+      </Button>
+    </div>
+  );
 }
