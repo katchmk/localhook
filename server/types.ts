@@ -164,3 +164,26 @@ export interface SentRequest extends Omit<SendInput, "sign"> {
   error: string | null;
   createdAt: number;
 }
+
+export interface TunnelState {
+  /** The provider name, for example "ngrok". */
+  provider: string;
+  status: "starting" | "up" | "error" | "stopped";
+  /** The public base URL, once the tunnel is up. */
+  url: string | null;
+  error: string | null;
+}
+
+/** The cloudflared provider for the user's own domain. It needs a saved hostname and tunnel token. */
+export const DOMAIN_PROVIDER = "cloudflared-domain";
+
+export interface TunnelInfo {
+  /** Null when no tunnel runs. */
+  state: TunnelState | null;
+  /** The provider names that PUT /api/tunnel accepts. */
+  providers: string[];
+  /** The local port that a Cloudflare public hostname must use as its service, as http://localhost:<port>. */
+  proxyPort: number;
+  /** The own-domain settings. The API never returns the token itself. */
+  domain: { hostname: string; tokenSet: boolean };
+}

@@ -379,6 +379,31 @@ export function openStore(path: string) {
       db.query("DELETE FROM saved_requests WHERE id = ?").run(id);
     },
 
+    /** The tunnel provider to start at boot. Empty for none. */
+    getTunnelProvider: (): string => {
+      const r = db.query("SELECT value FROM settings WHERE key = 'tunnel'").get() as Row | null;
+      return r?.value ?? "";
+    },
+
+    setTunnelProvider: (provider: string) => {
+      db.query("INSERT INTO settings (key, value) VALUES ('tunnel', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(
+        provider,
+      );
+    },
+
+    /** Hostname and Cloudflare tunnel token of the own-domain tunnel, or null when not set. */
+    getTunnelDomain: (): { hostname: string; token: string } | null => {
+      const r = db.query("SELECT value FROM settings WHERE key = 'tunnelDomain'").get() as Row | null;
+      return r ? JSON.parse(r.value) : null;
+    },
+
+    setTunnelDomain: (domain: { hostname: string; token: string } | null) => {
+      if (!domain) return void db.query("DELETE FROM settings WHERE key = 'tunnelDomain'").run();
+      db.query("INSERT INTO settings (key, value) VALUES ('tunnelDomain', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(
+        JSON.stringify(domain),
+      );
+    },
+
     /** Sender variables, used as {{name}}. Kept in order. */
     getVariables: (): HeaderPair[] => {
       const r = db.query("SELECT value FROM settings WHERE key = 'variables'").get() as Row | null;

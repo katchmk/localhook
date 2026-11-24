@@ -540,3 +540,116 @@ describe("saved requests and variables", () => {
     expect((await put({ a: 1 })).status).toBe(400);
   });
 });
+
+describe("tunnel", () => {
+  const fake = () => {
+    const started: string[] = [];
+    let current: string | null = null;
+    return {
+      started,
+      port: 8081,
+      providers: () => ["ngrok", "cloudflared", "cloudflared-domain"],
+      state: () => (current ? { provider: current, status: "up" as const, url: "https://a.example", error: null } : null),
+      start: (name: string) => {
+        if (!["ngrok", "cloudflared", "cloudflared-domain"].includes(name)) return false;
+        started.push(name);
+        current = name;
+        return true;
+      },
+      stop: () => void (current = null),
+    };
+  };
+  const put = (a: ReturnType<typeof createApp>, body: unknown) =>
+    a.request("/api/tunnel", { method: "PUT", body: JSON.stringify(body) });
+
+  test("reports no providers when tunnels are off", async () => {
+    expect(await (await app.request("/api/tunnel")).json()).toEqual({
+      state: null,
+      providers: [],
+      proxyPort: 0,
+      domain: { hostname: "", tokenSet: false },
+    });
+    expect((await put(app, { provider: "ngrok" })).status).toBe(400);
+  });
+
+  test("starts, switches and stops the tunnel, and remembers the choice", async () => {
+    const tunnel = fake();
+    const tunneled = createApp(store, createHub(), { ...config, tunnel });
+    const started = (await (await put(tunneled, { provider: "ngrok" })).json()) as { state: { provider: string } };
+    expect(started.state.provider).toBe("ngrok");
+    expect(store.getTunnelProvider()).toBe("ngrok");
+
+    await put(tunneled, { provider: "cloudflared" });
+    expect(tunnel.started).toEqual(["ngrok", "cloudflared"]);
+
+    expect(((await (await put(tunneled, { provider: "" })).json()) as { state: unknown }).state).toBeNull();
+    expect(store.getTunnelProvider()).toBe("");
+  });
+
+  test("rejects an unknown provider and a non-string value", async () => {
+    const tunneled = createApp(store, createHub(), { ...config, tunnel: fake() });
+    expect((await put(tunneled, { provider: "rm -rf" })).status).toBe(400);
+    expect((await put(tunneled, { provider: 1 })).status).toBe(400);
+    expect(store.getTunnelProvider()).toBe("");
+  });
+});
+
+describe("tunnel domain", () => {
+  const token = "eyJhIjoiYWNjb3VudCIsInQiOiJ0dW5uZWwifQ";
+  const withTunnel = () => {
+    let current: string | null = null;
+    const tunnel = {
+      port: 8081,
+      providers: () => ["ngrok", "cloudflared", "cloudflared-domain"],
+      state: () => (current ? { provider: current, status: "up" as const, url: "https://a.example", error: null } : null),
+      start: (name: string) => ((current = name), true),
+      stop: () => void (current = null),
+    };
+    return { tunnel, tunneled: createApp(store, createHub(), { ...config, tunnel }) };
+  };
+  const putDomain = (a: ReturnType<typeof createApp>, body: unknown) =>
+    a.request("/api/tunnel/domain", { method: "PUT", body: JSON.stringify(body) });
+  const info = async (res: Response) =>
+    (await res.json()) as { domain: { hostname: string; tokenSet: boolean }; proxyPort: number; state: unknown };
+
+  test("saves the hostname and token, and never returns the token", async () => {
+    const { tunneled } = withTunnel();
+    const res = await putDomain(tunneled, { hostname: "https://Hook.Example.com/", token });
+    const body = await info(res);
+    expect(body.domain).toEqual({ hostname: "hook.example.com", tokenSet: true });
+    expect(body.proxyPort).toBe(8081);
+    expect(JSON.stringify(body)).not.toContain(token);
+    expect(store.getTunnelDomain()).toEqual({ hostname: "hook.example.com", token });
+  });
+
+  test("keeps the saved token when only the hostname changes", async () => {
+    const { tunneled } = withTunnel();
+    await putDomain(tunneled, { hostname: "a.example.com", token });
+    expect((await putDomain(tunneled, { hostname: "b.example.com" })).status).toBe(200);
+    expect(store.getTunnelDomain()).toEqual({ hostname: "b.example.com", token });
+  });
+
+  test("rejects a bad hostname, a missing token and a bad token", async () => {
+    const { tunneled } = withTunnel();
+    for (const hostname of ["nope", "a b.example.com", "x.example.com/path", "-a.example.com"]) {
+      expect([hostname, (await putDomain(tunneled, { hostname, token })).status]).toEqual([hostname, 400]);
+    }
+    expect((await putDomain(tunneled, { hostname: "a.example.com" })).status).toBe(400);
+    expect((await putDomain(tunneled, { hostname: "a.example.com", token: "bad token!" })).status).toBe(400);
+    expect(store.getTunnelDomain()).toBeNull();
+  });
+
+  test("restarts a running own-domain tunnel when saved, and stops it when removed", async () => {
+    const { tunnel, tunneled } = withTunnel();
+    await putDomain(tunneled, { hostname: "a.example.com", token });
+    tunnel.start("cloudflared-domain");
+    await putDomain(tunneled, { hostname: "b.example.com" });
+    expect(tunnel.state()?.provider).toBe("cloudflared-domain");
+    store.setTunnelProvider("cloudflared-domain");
+
+    const removed = await info(await putDomain(tunneled, { hostname: "" }));
+    expect(removed.state).toBeNull();
+    expect(removed.domain).toEqual({ hostname: "", tokenSet: false });
+    expect(store.getTunnelProvider()).toBe("");
+  });
+});

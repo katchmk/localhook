@@ -3,6 +3,7 @@ import {
   FileDown,
   Forward,
   GitCompare,
+  Globe,
   Plus,
   Radio,
   RefreshCw,
@@ -13,18 +14,20 @@ import {
   Upload,
   X,
 } from "lucide-react";
-import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useReducer, useRef, useState, type ReactNode } from "react";
 import {
   api,
+  DOMAIN_PROVIDER,
   exportUrl,
   FORWARD_MODES,
   hookUrl,
   SIGNATURE_SCHEMES,
-  streamUrl,
-  type CapturedRequestSummary,
   type Endpoint,
   type ResponseRule,
+  type TunnelInfo,
 } from "./api";
+import { useDebounced, useEndpointMutations, useEndpoints, useRequests, useRequestStream, useTunnel } from "./queries";
+import { initialReceiverState, receiverReducer, visibleSelection } from "./receiverState";
 import { RequestDetail } from "./RequestDetail";
 import { RequestDiff } from "./RequestDiff";
 import {
@@ -46,22 +49,80 @@ import {
 
 const METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"];
 
+const providerLabel = (name: string) => (name === DOMAIN_PROVIDER ? "cloudflared (own domain)" : name);
+
+/** Sets up cloudflared with the user's own domain: a hostname and the token of a Cloudflare tunnel. */
+function TunnelDomainForm({
+  info,
+  onSave,
+}: {
+  info: TunnelInfo;
+  onSave: (hostname: string, token: string) => Promise<boolean>;
+}) {
+  const [hostname, setHostname] = useState(info.domain.hostname);
+  const [token, setToken] = useState("");
+  const [busy, setBusy] = useState(false);
+  const save = async (host: string) => {
+    setBusy(true);
+    const ok = await onSave(host, token);
+    setBusy(false);
+    if (ok) setToken("");
+    if (ok && !host) setHostname("");
+  };
+  return (
+    <form
+      className="-mt-2 flex flex-col gap-3 rounded-md border border-zinc-800 bg-zinc-900/40 p-4"
+      onSubmit={(e) => {
+        e.preventDefault();
+        void save(hostname);
+      }}
+    >
+      <ol className="list-decimal space-y-1 pl-5 text-xs text-zinc-400">
+        <li>
+          In Cloudflare Zero Trust, open Networks → Tunnels, create a tunnel (type cloudflared) and copy its token.
+        </li>
+        <li>
+          Add a public hostname for your domain, for example <code>hook.example.com</code>. Set its service to HTTP and{" "}
+          <code className="text-zinc-200">localhost:{info.proxyPort}</code>.
+        </li>
+        <li>Enter the hostname and the token here. localhook starts the tunnel when you save.</li>
+      </ol>
+      <div className="flex flex-wrap gap-2">
+        <input
+          value={hostname}
+          onChange={(e) => setHostname(e.target.value)}
+          placeholder="hook.example.com"
+          aria-label="Public hostname"
+          autoComplete="off"
+          spellCheck={false}
+          className={cx(inputClass, "h-9 min-w-48 flex-1")}
+        />
+        <input
+          type="password"
+          value={token}
+          onChange={(e) => setToken(e.target.value)}
+          placeholder={info.domain.tokenSet ? "Token saved (enter a new one to replace it)" : "Tunnel token"}
+          aria-label="Tunnel token"
+          autoComplete="off"
+          className={cx(inputClass, "h-9 min-w-48 flex-[2]")}
+        />
+        <Button type="submit" disabled={busy || !hostname.trim() || (!token && !info.domain.tokenSet)}>
+          Save and start
+        </Button>
+        {info.domain.tokenSet && (
+          <Button type="button" variant="danger" disabled={busy} onClick={() => void save("")}>
+            Remove
+          </Button>
+        )}
+      </div>
+    </form>
+  );
+}
+
 const goTo = (id: string) => (window.location.hash = `#/receiver/${id}`);
 
 export function Receiver({ endpointId }: { endpointId: string | null }) {
-  const [endpoints, setEndpoints] = useState<Endpoint[] | null>(null);
-  const [error, setError] = useState<string | null>(null);
-
-  const reloadEndpoints = useCallback(async () => {
-    let list = await api.listEndpoints();
-    if (list.length === 0) list = [await api.createEndpoint({ name: "Default" })];
-    setEndpoints(list);
-    return list;
-  }, []);
-
-  useEffect(() => {
-    reloadEndpoints().catch((e) => setError(String(e)));
-  }, [reloadEndpoints]);
+  const { data: endpoints, error } = useEndpoints();
 
   // Fall back to the first endpoint when the hash has none or an unknown one.
   const endpoint = endpoints?.find((e) => e.id === endpointId) ?? null;
@@ -69,96 +130,37 @@ export function Receiver({ endpointId }: { endpointId: string | null }) {
     if (endpoints && !endpoint && endpoints[0]) goTo(endpoints[0].id);
   }, [endpoints, endpoint]);
 
-  if (error) return <p className="text-rose-400">{error}</p>;
+  if (error) return <p className="text-rose-400">{String(error)}</p>;
   if (!endpoint || !endpoints) return null;
 
-  return <EndpointView key={endpoint.id} endpoint={endpoint} endpoints={endpoints} onEndpointsChanged={reloadEndpoints} />;
+  return <EndpointView key={endpoint.id} endpoint={endpoint} endpoints={endpoints} />;
 }
 
-function EndpointView({
-  endpoint,
-  endpoints,
-  onEndpointsChanged,
-}: {
-  endpoint: Endpoint;
-  endpoints: Endpoint[];
-  onEndpointsChanged: () => Promise<Endpoint[]>;
-}) {
-  const [requests, setRequests] = useState<CapturedRequestSummary[]>([]);
-  const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [live, setLive] = useState(false);
-  const [showSettings, setShowSettings] = useState(false);
-  const [search, setSearch] = useState("");
-  const [query, setQuery] = useState(""); // `search`, applied after a short pause in typing
-  const [method, setMethod] = useState("");
-  /** Ids picked for compare; null when compare mode is off. */
-  const [compare, setCompare] = useState<string[] | null>(null);
+function EndpointView({ endpoint, endpoints }: { endpoint: Endpoint; endpoints: Endpoint[] }) {
+  const [state, dispatch] = useReducer(receiverReducer, initialReceiverState);
+  const { showSettings, showDomain, search, method, compare } = state;
+  const query = useDebounced(search.trim(), 250);
+  const filtered = !!(query || method);
+  const { data: requests = [] } = useRequests(endpoint.id, { q: query, method });
+  const selectedId = visibleSelection(
+    state.selectedId,
+    requests.map((r) => r.id),
+  );
+  const live = useRequestStream(endpoint.id, (req) => dispatch({ type: "selectionPinned", id: selectedId ?? req.id }));
+  const mutations = useEndpointMutations(endpoint.id);
+  const { info: tunnelInfo, choose: chooseTunnel, saveDomain } = useTunnel();
   const importInput = useRef<HTMLInputElement>(null);
   const now = useNow();
   const url = hookUrl(endpoint.id);
-  const filtered = !!(query || method);
-  const filteredRef = useRef(filtered);
-  filteredRef.current = filtered;
-
-  useEffect(() => {
-    const t = setTimeout(() => setQuery(search.trim()), 250);
-    return () => clearTimeout(t);
-  }, [search]);
+  const tunnel = tunnelInfo?.state ?? null;
+  const publicUrl = tunnel?.url ? `${tunnel.url}/hook/${endpoint.id}` : null;
 
   useEffect(() => {
     if (!showSettings) return;
-    const onKey = (e: KeyboardEvent) => e.key === "Escape" && setShowSettings(false);
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && dispatch({ type: "settingsClosed" });
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [showSettings]);
-
-  const reload = useCallback(async () => {
-    const list = await api.listRequests(endpoint.id, { q: query, method });
-    setRequests(list);
-    setSelectedId((cur) => (cur && list.some((r) => r.id === cur) ? cur : (list[0]?.id ?? null)));
-  }, [endpoint.id, query, method]);
-  const reloadRef = useRef(reload);
-  reloadRef.current = reload;
-
-  useEffect(() => {
-    void reload();
-  }, [reload]);
-
-  useEffect(() => {
-    const es = new EventSource(streamUrl(endpoint.id));
-    es.addEventListener("ready", () => setLive(true));
-    es.addEventListener("request", (e) => {
-      // The summary has no headers or body, so only the server can tell if it matches a search.
-      if (filteredRef.current) return void reloadRef.current();
-      const req = JSON.parse((e as MessageEvent).data) as CapturedRequestSummary;
-      // A known id is an update, e.g. a forward result; keep its place in the list.
-      setRequests((cur) =>
-        cur.some((r) => r.id === req.id) ? cur.map((r) => (r.id === req.id ? req : r)) : [req, ...cur],
-      );
-      setSelectedId((cur) => cur ?? req.id);
-    });
-    es.onerror = () => setLive(false);
-    return () => es.close();
-  }, [endpoint.id]);
-
-  const importFile = async (file: File | undefined) => {
-    if (!file) return;
-    try {
-      const { imported } = await api.importRequests(endpoint.id, await file.text());
-      await reload();
-      await onEndpointsChanged();
-      alert(`Imported ${imported} request${imported === 1 ? "" : "s"}.`);
-    } catch (e) {
-      alert(String(e));
-    }
-  };
-
-  const toggleCompare = (id: string) =>
-    setCompare((cur) => {
-      if (!cur) return cur;
-      if (cur.includes(id)) return cur.filter((c) => c !== id);
-      return [...cur, id].slice(-2); // A third pick replaces the oldest pick.
-    });
 
   const sendTest = () =>
     fetch(`${url}/test?source=localhook`, {
@@ -167,23 +169,16 @@ function EndpointView({
       body: JSON.stringify({ event: "test.ping", sentAt: new Date().toISOString(), data: { hello: "world" } }),
     });
 
-  const createEndpoint = async () => {
+  const createEndpoint = () => {
     const id = prompt("Endpoint id (letters, digits, - and _). Leave empty for a random id.");
     if (id === null) return;
-    try {
-      const ep = await api.createEndpoint({ id: id.trim() || undefined });
-      await onEndpointsChanged();
-      goTo(ep.id);
-    } catch (e) {
-      alert(String(e));
-    }
+    mutations.create.mutate(id.trim() || undefined, { onSuccess: (ep) => goTo(ep.id) });
   };
 
-  const deleteEndpoint = async () => {
+  const deleteEndpoint = () => {
     if (!confirm(`Delete endpoint "${endpoint.name}" and all its requests?`)) return;
-    await api.deleteEndpoint(endpoint.id);
-    const list = await onEndpointsChanged();
-    if (list[0]) goTo(list[0].id);
+    // The hash then names an unknown endpoint, so Receiver opens the first endpoint.
+    mutations.remove.mutate();
   };
 
   return (
@@ -215,7 +210,7 @@ function EndpointView({
             <Button size="sm" onClick={createEndpoint}>
               <Plus className="size-4" /> New endpoint
             </Button>
-            <Button size="sm" variant={showSettings ? "primary" : "secondary"} onClick={() => setShowSettings((s) => !s)}>
+            <Button size="sm" variant={showSettings ? "primary" : "secondary"} onClick={() => dispatch({ type: "settingsToggled" })}>
               <Settings className="size-4" /> Settings
             </Button>
             <Button size="icon" variant="danger" title="Delete endpoint" onClick={deleteEndpoint}>
@@ -233,6 +228,67 @@ function EndpointView({
             <Send className="size-4" /> Send test request
           </Button>
         </div>
+        {tunnelInfo && tunnelInfo.providers.length > 0 && (
+          <div className="-mt-2 flex gap-2">
+            <select
+              value={tunnel?.status === "stopped" ? "" : (tunnel?.provider ?? "")}
+              onChange={(e) => chooseTunnel.mutate(e.target.value)}
+              className={cx(inputClass, "h-10 font-sans")}
+              aria-label="Tunnel provider"
+            >
+              <option value="">No tunnel</option>
+              {tunnelInfo.providers.map((p) => (
+                <option key={p} value={p}>
+                  {providerLabel(p)}
+                </option>
+              ))}
+            </select>
+            <Button
+              size="icon"
+              variant={showDomain ? "primary" : "secondary"}
+              className="size-10" // The same height as the select and the URL box in this row.
+              title="Use your own domain with cloudflared"
+              aria-label="Own domain settings"
+              aria-expanded={showDomain}
+              onClick={() => dispatch({ type: "domainToggled" })}
+            >
+              <Globe className="size-4" />
+            </Button>
+            {tunnel && tunnel.status !== "stopped" && (
+              <div
+                className={cx(
+                  inputClass,
+                  "flex h-10 flex-1 items-center justify-between gap-2 pr-1",
+                  tunnel.status === "error" && "border-red-500/40",
+                )}
+              >
+                {publicUrl ? (
+                  <>
+                    <span className="truncate" title={`Public URL through ${providerLabel(tunnel.provider)}`}>
+                      {publicUrl}
+                    </span>
+                    <CopyButton text={publicUrl} />
+                  </>
+                ) : (
+                  <span
+                    className={cx("truncate text-xs", tunnel.status === "error" && "text-red-400")}
+                    title={tunnel.error ?? undefined}
+                  >
+                    {tunnel.status === "starting"
+                      ? `Starting ${providerLabel(tunnel.provider)} tunnel… this can take a few minutes`
+                      : `${providerLabel(tunnel.provider)} tunnel failed: ${tunnel.error?.split("\n").join(" ")}`}
+                  </span>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+        {tunnelInfo && showDomain && (
+          <TunnelDomainForm
+            info={tunnelInfo}
+            onSave={(hostname, token) => saveDomain.mutateAsync({ hostname, token }).then(() => true, () => false)}
+          />
+        )}
         <p className="-mt-2 text-xs text-zinc-500">
           Send any HTTP method to this URL or any subpath of it. From other containers, use the container name instead
           of <code>localhost</code>.
@@ -258,10 +314,8 @@ function EndpointView({
         {showSettings && (
           <EndpointSettings
             endpoint={endpoint}
-            onSaved={async () => {
-              await onEndpointsChanged();
-              setShowSettings(false);
-            }}
+            onSave={(patch) => mutations.update.mutateAsync(patch)}
+            onSaved={() => dispatch({ type: "settingsClosed" })}
           />
         )}
       </Panel>
@@ -277,7 +331,7 @@ function EndpointView({
                   variant={compare ? "primary" : "ghost"}
                   size="icon"
                   aria-label={compare ? "Stop comparing" : "Compare two requests"}
-                  onClick={() => setCompare((cur) => (cur ? null : []))}
+                  onClick={() => dispatch({ type: "compareToggled" })}
                 >
                   <GitCompare className="size-4" />
                 </Button>
@@ -288,7 +342,8 @@ function EndpointView({
                 accept=".json,.har,application/json"
                 className="hidden"
                 onChange={(e) => {
-                  void importFile(e.target.files?.[0]);
+                  const file = e.target.files?.[0];
+                  if (file) mutations.importFile.mutate(file);
                   e.target.value = ""; // Allow picking the same file again.
                 }}
               />
@@ -312,7 +367,7 @@ function EndpointView({
                 </a>
               </Tooltip>
               <Tooltip label="Refresh">
-                <Button variant="ghost" size="icon" aria-label="Refresh" onClick={reload}>
+                <Button variant="ghost" size="icon" aria-label="Refresh" onClick={() => void mutations.refreshRequests()}>
                   <RefreshCw className="size-4" />
                 </Button>
               </Tooltip>
@@ -321,10 +376,8 @@ function EndpointView({
                   variant="danger"
                   size="icon"
                   aria-label="Clear all requests"
-                  onClick={async () => {
-                    await api.clearRequests(endpoint.id);
-                    await reload();
-                  }}
+                  disabled={mutations.clear.isPending}
+                  onClick={() => mutations.clear.mutate()}
                 >
                   <Trash2 className="size-4" />
                 </Button>
@@ -335,7 +388,7 @@ function EndpointView({
             <select
               className={cx(inputClass, "h-8 px-2")}
               value={method}
-              onChange={(e) => setMethod(e.target.value)}
+              onChange={(e) => dispatch({ type: "methodChanged", method: e.target.value })}
               aria-label="Filter by method"
             >
               <option value="">All</option>
@@ -349,11 +402,11 @@ function EndpointView({
                 className="min-w-0 flex-1 bg-transparent focus:outline-none"
                 placeholder="Search path, headers, body"
                 value={search}
-                onChange={(e) => setSearch(e.target.value)}
+                onChange={(e) => dispatch({ type: "searchChanged", search: e.target.value })}
                 aria-label="Search requests"
               />
               {search && (
-                <button type="button" title="Clear search" onClick={() => setSearch("")}>
+                <button type="button" title="Clear search" onClick={() => dispatch({ type: "searchChanged", search: "" })}>
                   <X className="size-3.5 text-zinc-500 hover:text-zinc-200" />
                 </button>
               )}
@@ -373,7 +426,7 @@ function EndpointView({
             {requests.map((r) => (
               <li key={r.id}>
                 <button
-                  onClick={() => (compare ? toggleCompare(r.id) : setSelectedId(r.id))}
+                  onClick={() => dispatch({ type: "rowClicked", id: r.id })}
                   className={cx(
                     "flex w-full flex-col gap-1.5 border-b border-l-2 border-b-zinc-800/60 px-4 py-3 text-left transition-colors",
                     (compare ? compare.includes(r.id) : r.id === selectedId)
@@ -414,14 +467,14 @@ function EndpointView({
 
         <Panel className="min-h-0 overflow-y-auto">
           {compare?.length === 2 ? (
-            <RequestDiff ids={compare as [string, string]} onClose={() => setCompare(null)} />
+            <RequestDiff ids={compare as [string, string]} onClose={() => dispatch({ type: "compareClosed" })} />
           ) : selectedId ? (
             <RequestDetail
               key={selectedId}
               id={selectedId}
               endpointId={endpoint.id}
               forward={requests.find((r) => r.id === selectedId)?.forward ?? null}
-              onDeleted={reload}
+              onDeleted={() => void mutations.refreshRequests()}
             />
           ) : (
             <div className="flex h-full min-h-60 flex-col items-center justify-center gap-2 p-8 text-center text-zinc-500">
@@ -451,7 +504,15 @@ const newRule = (): RuleDraft => ({
   delayMs: "0",
 });
 
-function EndpointSettings({ endpoint, onSaved }: { endpoint: Endpoint; onSaved: () => void }) {
+function EndpointSettings({
+  endpoint,
+  onSave,
+  onSaved,
+}: {
+  endpoint: Endpoint;
+  onSave: (patch: Parameters<typeof api.updateEndpoint>[1]) => Promise<unknown>;
+  onSaved: () => void;
+}) {
   const [form, setForm] = useState({
     name: endpoint.name,
     responseStatus: String(endpoint.responseStatus),
@@ -479,7 +540,7 @@ function EndpointSettings({ endpoint, onSaved }: { endpoint: Endpoint; onSaved: 
       onSubmit={async (e) => {
         e.preventDefault();
         try {
-          await api.updateEndpoint(endpoint.id, {
+          await onSave({
             ...form,
             responseStatus: Number(form.responseStatus),
             responseDelayMs: Number(form.responseDelayMs || 0),

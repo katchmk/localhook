@@ -1,28 +1,19 @@
 import { ClipboardPaste, FileUp, Info, Save, Send, X } from "lucide-react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
+import { useEffect, useReducer, useRef, useState } from "react";
 import {
-  api,
   DEFAULT_CUSTOM_SIGNATURE,
   SIGNATURE_SCHEMES,
   type HeaderPair,
   type OutgoingSignature,
-  type SavedRequest,
   type SenderAuth,
   type SentRequest,
 } from "./api";
 import { parseCurl } from "./curl";
-import {
-  draftFromCaptured,
-  draftFromCurl,
-  draftFromSaved,
-  draftFromSent,
-  draftToSaved,
-  initialDraft,
-  toSendInput,
-  unknownVariables,
-  type Draft,
-} from "./senderDraft";
+import { fetchRequest, useEndpoints, useSenderData, useSenderMutations } from "./queries";
+import { draftFromCaptured, draftFromCurl, draftToSaved, toSendInput, unknownVariables, type Draft } from "./senderDraft";
 import { SenderSidebar } from "./SenderSidebar";
+import { initialSenderState, senderReducer } from "./senderState";
 import {
   Button,
   CodeView,
@@ -68,82 +59,58 @@ function defaultName(d: Draft) {
   return `${d.method} ${path}`;
 }
 
-type EditorTab = "body" | "auth" | "signature" | "headers" | "cookies";
-
 /** `fromRequestId` loads a captured request into the editor. */
 export function Sender({ fromRequestId }: { fromRequestId: string | null }) {
-  const [draft, setDraft] = useState<Draft>(initialDraft);
-  const [history, setHistory] = useState<SentRequest[]>([]);
-  const [saved, setSaved] = useState<SavedRequest[]>([]);
-  const [variables, setVariables] = useState<HeaderPair[]>([]);
-  /** The saved request in the editor, which Save updates. Null for a new request. */
-  const [current, setCurrent] = useState<SavedRequest | null>(null);
-  const [response, setResponse] = useState<SentRequest | null>(null);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [tab, setTab] = useState<EditorTab>("body");
-  const [showImport, setShowImport] = useState(false);
-
-  const reloadHistory = useCallback(() => api.listSent().then(setHistory), []);
-  const reloadSaved = useCallback(() => api.listSaved().then(setSaved), []);
+  const [state, dispatch] = useReducer(senderReducer, undefined, initialSenderState);
+  const { draft, current, response, error, tab, showImport } = state;
+  const { history, saved, variables } = useSenderData();
+  const mutations = useSenderMutations();
+  const qc = useQueryClient();
+  const { data: endpoints } = useEndpoints();
+  const busy = mutations.send.isPending;
+  const setDraft = (next: Draft | ((d: Draft) => Draft)) =>
+    dispatch({ type: "draftUpdated", update: typeof next === "function" ? next : () => next });
+  const fail = (e: unknown) => dispatch({ type: "failed", error: String(e) });
 
   useEffect(() => {
-    void reloadHistory();
-    void reloadSaved();
-    api.getVariables().then(setVariables);
-    if (fromRequestId) {
-      api
-        .getRequest(fromRequestId)
-        .then((r) => setDraft(draftFromCaptured(r)))
-        .catch((e) => setError(String(e)));
-      // Drop the id from the URL, so a page reload does not replace later edits.
-      window.history.replaceState(null, "", "#/sender");
-      return;
-    }
-    // Default the target to the first local endpoint, so a first send shows up in the Receiver.
-    api.listEndpoints().then((eps) => {
-      if (eps[0]) setDraft((d) => (d.url ? d : { ...d, url: `http://localhost:8080/hook/${eps[0]!.id}` }));
-    });
-  }, [fromRequestId, reloadHistory, reloadSaved]);
+    if (!fromRequestId) return;
+    fetchRequest(qc, fromRequestId).then((r) => dispatch({ type: "unsavedLoaded", draft: draftFromCaptured(r) }), fail);
+    // Drop the id from the URL, so a page reload does not replace later edits.
+    window.history.replaceState(null, "", "#/sender");
+  }, [fromRequestId, qc]);
+
+  // Default the target to the first local endpoint, so a first send shows up in the Receiver.
+  const firstEndpoint = endpoints?.[0]?.id;
+  useEffect(() => {
+    if (!fromRequestId && firstEndpoint)
+      dispatch({ type: "defaultUrlFound", url: `http://localhost:8080/hook/${firstEndpoint}` });
+  }, [fromRequestId, firstEndpoint]);
 
   const unknown = unknownVariables(draft, variables);
 
-  const send = async () => {
-    setBusy(true);
-    setError(null);
-    try {
-      const res = await api.send(toSendInput(draft, variables));
-      setResponse(res);
-      await reloadHistory();
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  /** Loads a request that is not a saved one, so Save makes a new saved request. */
-  const loadUnsaved = (d: Draft) => {
-    setDraft(d);
-    setCurrent(null);
-    setError(null);
+  const send = () => {
+    dispatch({ type: "sendStarted" });
+    mutations.send.mutate(toSendInput(draft, variables), {
+      onSuccess: (res) => dispatch({ type: "responseReceived", response: res }),
+      onError: fail,
+    });
   };
 
   const save = async (asNew: boolean) => {
-    setError(null);
+    const request = draftToSaved(draft);
     try {
       if (current && !asNew) {
-        setCurrent(await api.updateSaved(current.id, { request: draftToSaved(draft) }));
-      } else {
-        const name = prompt("Name of the saved request", current?.name ?? defaultName(draft));
-        if (!name?.trim()) return;
-        const collection = prompt("Collection", current?.collection ?? "Default");
-        if (collection === null) return;
-        setCurrent(await api.createSaved({ collection: collection.trim() || "Default", name, request: draftToSaved(draft) }));
+        dispatch({ type: "savedStored", saved: await mutations.updateSaved.mutateAsync({ id: current.id, request }) });
+        return;
       }
-      await reloadSaved();
+      const name = prompt("Name of the saved request", current?.name ?? defaultName(draft));
+      if (!name?.trim()) return;
+      const collection = prompt("Collection", current?.collection ?? "Default");
+      if (collection === null) return;
+      const created = await mutations.createSaved.mutateAsync({ collection: collection.trim() || "Default", name, request });
+      dispatch({ type: "savedStored", saved: created });
     } catch (e) {
-      setError(String(e));
+      fail(e);
     }
   };
 
@@ -152,29 +119,17 @@ export function Sender({ fromRequestId }: { fromRequestId: string | null }) {
       <SenderSidebar
         history={history}
         selectedSentId={response?.id ?? null}
-        onLoadSent={(s) => {
-          loadUnsaved(draftFromSent(s));
-          setResponse(s);
-        }}
-        onClearHistory={async () => {
-          await api.clearSent();
-          await reloadHistory();
-        }}
+        onLoadSent={(sent) => dispatch({ type: "sentLoaded", sent })}
+        onClearHistory={() => mutations.clearHistory.mutate()}
         saved={saved}
         selectedSavedId={current?.id ?? null}
-        onLoadSaved={(s) => {
-          setDraft(draftFromSaved(s.request));
-          setCurrent(s);
-          setError(null);
-        }}
-        onDeleteSaved={async (s) => {
+        onLoadSaved={(s) => dispatch({ type: "savedLoaded", saved: s })}
+        onDeleteSaved={(s) => {
           if (!confirm(`Delete the saved request "${s.name}"?`)) return;
-          await api.deleteSaved(s.id);
-          if (current?.id === s.id) setCurrent(null);
-          await reloadSaved();
+          mutations.deleteSaved.mutate(s, { onSuccess: () => dispatch({ type: "savedDeleted", id: s.id }) });
         }}
         variables={variables}
-        onSaveVariables={async (v) => setVariables(await api.setVariables(v))}
+        onSaveVariables={async (v) => void (await mutations.setVariables.mutateAsync(v))}
       />
 
       <div className="flex min-h-0 flex-col gap-4 overflow-y-auto">
@@ -186,7 +141,7 @@ export function Sender({ fromRequestId }: { fromRequestId: string | null }) {
               <button type="button" className="text-sky-400 hover:underline" onClick={() => save(true)}>
                 Save as new
               </button>
-              <Button variant="ghost" size="icon" title="Stop editing this saved request" onClick={() => setCurrent(null)}>
+              <Button variant="ghost" size="icon" title="Stop editing this saved request" onClick={() => dispatch({ type: "currentCleared" })}>
                 <X className="size-4" />
               </Button>
             </div>
@@ -195,7 +150,7 @@ export function Sender({ fromRequestId }: { fromRequestId: string | null }) {
             className="flex flex-wrap gap-2"
             onSubmit={(e) => {
               e.preventDefault();
-              void send();
+              send();
             }}
           >
             <select
@@ -228,17 +183,14 @@ export function Sender({ fromRequestId }: { fromRequestId: string | null }) {
               size="icon"
               className="size-10"
               title="Import a cURL command"
-              onClick={() => setShowImport((v) => !v)}
+              onClick={() => dispatch({ type: "importToggled" })}
             >
               <ClipboardPaste className="size-4" />
             </Button>
           </form>
           {showImport && (
             <CurlImport
-              onImport={(d) => {
-                loadUnsaved(d);
-                setShowImport(false);
-              }}
+              onImport={(d) => dispatch({ type: "curlImported", draft: d })}
             />
           )}
           <p className="-mt-2 text-xs text-zinc-500">
@@ -254,7 +206,7 @@ export function Sender({ fromRequestId }: { fromRequestId: string | null }) {
 
           <Tabs
             value={tab}
-            onChange={setTab}
+            onChange={(t) => dispatch({ type: "tabChanged", tab: t })}
             tabs={[
               { id: "body", label: "Body" },
               { id: "auth", label: draft.auth.type === "none" ? "Auth" : `Auth (${AUTH_LABELS[draft.auth.type]})` },

@@ -63,3 +63,12 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+      # Copies README.md to the Docker Hub overview. The token needs the "Read, Write, Delete" scope.
+      - uses: peter-evans/dockerhub-description@v4
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          repository: ${{ vars.DOCKERHUB_USERNAME }}/localhook
+          short-description: ${{ github.event.repository.description }}
+          # Makes relative links and images (docs/*.png) absolute GitHub URLs.
+          enable-url-completion: true
