@@ -8,8 +8,10 @@ import type { Hub } from "./hub";
 import { sendRaw, sendRequest } from "./send";
 import { checkSignature, signRequest } from "./signature";
 import { parseImport, toHar } from "./transfer";
+import type { TunnelManager } from "./tunnel";
 import {
   DEFAULT_CUSTOM_SIGNATURE,
+  DOMAIN_PROVIDER,
   FORWARD_MODES,
   SIGNATURE_ALGORITHMS,
   SIGNATURE_SCHEMES,
@@ -22,6 +24,7 @@ import {
   type SendInput,
   type SenderAuth,
   type SignatureScheme,
+  type TunnelInfo,
 } from "./types";
 
 export interface Config {
@@ -33,6 +36,8 @@ export interface Config {
   staticDir?: string;
   /** HTTP Basic auth for the UI and API. Webhook URLs stay open. Omit to disable. */
   auth?: { username: string; password: string };
+  /** Starts and stops the tunnel that gives the receiver a public URL. Omit to turn tunnels off. */
+  tunnel?: TunnelManager;
 }
 
 const MAX_DELAY_MS = 60_000;
@@ -40,6 +45,10 @@ const MAX_DELAY_MS = 60_000;
 // Each forward adds 1 to this header. Endpoints that forward to each other stop after MAX_HOPS.
 const HOPS_HEADER = "x-localhook-hops";
 const MAX_HOPS = 5;
+
+const HOSTNAME_PATTERN = /^(?=.{4,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/;
+// Cloudflare tunnel tokens are base64 text.
+const TOKEN_PATTERN = /^[A-Za-z0-9+/_=-]{20,2000}$/;
 
 const ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
 
@@ -552,6 +561,47 @@ export function createApp(store: Store, hub: Hub, config: Config) {
     if (!isPairs(input)) return c.json({ error: "Variables must be [name, value] pairs" }, 400);
     store.setVariables(input.filter(([k]) => k.trim()).map(([k, v]) => [k.trim(), v]));
     return c.json(store.getVariables());
+  });
+
+  const tunnelInfo = (): TunnelInfo => ({
+    state: config.tunnel?.state() ?? null,
+    providers: config.tunnel?.providers() ?? [],
+    proxyPort: config.tunnel?.port ?? 0,
+    domain: { hostname: store.getTunnelDomain()?.hostname ?? "", tokenSet: !!store.getTunnelDomain() },
+  });
+  api.get("/tunnel", (c) => c.json(tunnelInfo()));
+
+  // Body: { provider: "ngrok" } to start (or switch), { provider: "" } to stop. The choice is kept for the next boot.
+  api.put("/tunnel", async (c) => {
+    const input = await c.req.json().catch(() => null);
+    const provider = typeof input?.provider === "string" ? input.provider : null;
+    if (!config.tunnel || provider === null) return c.json({ error: "provider must be a string" }, 400);
+    if (provider === "") config.tunnel.stop();
+    else if (!config.tunnel.start(provider)) return c.json({ error: `Unknown tunnel provider "${provider}"` }, 400);
+    store.setTunnelProvider(provider);
+    return c.json(tunnelInfo());
+  });
+
+  // Body: { hostname, token? }. An empty hostname removes the settings. A missing token keeps the saved one.
+  api.put("/tunnel/domain", async (c) => {
+    const input = await c.req.json().catch(() => null);
+    if (!config.tunnel || typeof input?.hostname !== "string") return c.json({ error: "hostname must be a string" }, 400);
+    const stopIfRunning = () => {
+      if (config.tunnel!.state()?.provider === DOMAIN_PROVIDER) config.tunnel!.stop();
+    };
+    const hostname = input.hostname.trim().replace(/^https?:\/\//i, "").replace(/\/+$/, "").toLowerCase();
+    if (!hostname) {
+      stopIfRunning();
+      store.setTunnelDomain(null);
+      if (store.getTunnelProvider() === DOMAIN_PROVIDER) store.setTunnelProvider("");
+      return c.json(tunnelInfo());
+    }
+    if (!HOSTNAME_PATTERN.test(hostname)) return c.json({ error: "Enter a hostname such as hook.example.com" }, 400);
+    const token = typeof input.token === "string" && input.token.trim() ? input.token.trim() : store.getTunnelDomain()?.token;
+    if (!token || !TOKEN_PATTERN.test(token)) return c.json({ error: "Enter the tunnel token from Cloudflare" }, 400);
+    store.setTunnelDomain({ hostname, token });
+    if (config.tunnel.state()?.provider === DOMAIN_PROVIDER) config.tunnel.start(DOMAIN_PROVIDER); // Use the new settings.
+    return c.json(tunnelInfo());
   });
 
   app.route("/api", api);

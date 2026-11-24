@@ -19,6 +19,7 @@ services:
     #   SEND_TIMEOUT_MS: "30000"
     #   AUTH_USERNAME: "admin"
     #   AUTH_PASSWORD: "change-me"
+    #   NGROK_AUTHTOKEN: "<token>"     # only for ngrok
 
 volumes:
   localhook-data:

@@ -7,11 +7,13 @@ import type {
   SavedRequestData,
   SendInput,
   SentRequest,
+  TunnelInfo,
 } from "../../server/types";
 
 export type * from "../../server/types";
 export {
   DEFAULT_CUSTOM_SIGNATURE,
+  DOMAIN_PROVIDER,
   FORWARD_MODES,
   SIGNATURE_ALGORITHMS,
   SIGNATURE_SCHEMES,
@@ -30,6 +32,11 @@ async function call<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
+  getTunnel: () => call<TunnelInfo>("/tunnel"),
+  setTunnel: (provider: string) => call<TunnelInfo>("/tunnel", { method: "PUT", body: JSON.stringify({ provider }) }),
+  /** An empty hostname removes the own-domain settings. Without a token, the saved token stays. */
+  setTunnelDomain: (input: { hostname: string; token?: string }) =>
+    call<TunnelInfo>("/tunnel/domain", { method: "PUT", body: JSON.stringify(input) }),
   listEndpoints: () => call<Endpoint[]>("/endpoints"),
   createEndpoint: (input: { id?: string; name?: string } = {}) =>
     call<Endpoint>("/endpoints", { method: "POST", body: JSON.stringify(input) }),

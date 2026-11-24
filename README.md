@@ -63,6 +63,30 @@ Inside the container, `localhost` is the container itself. To send to a service 
 | `SEND_TIMEOUT_MS` | `30000` | Timeout for sent, replayed and forwarded requests |
 | `AUTH_PASSWORD` | none | Turns on HTTP Basic auth for the UI and API. Webhook URLs (`/hook/...`) stay open |
 | `AUTH_USERNAME` | `admin` | Basic auth user name |
+| `HOOK_PROXY_PORT` | `PORT` + 1 | Local port of the hook-only proxy that tunnels expose. A Cloudflare public hostname for your own domain points at this port. If the port is in use, a free port is used |
+| `TUNNEL_COMMAND` | none | Adds a `custom` provider that runs this command. `{port}` is replaced with the port of the hook-only proxy. Only the environment can set it, never the UI or API |
+
+### Tunnels
+
+Pick a provider in the Receiver (the list under the webhook URL). localhook starts the provider's CLI and shows the public webhook URL. The choice is saved and starts again at the next boot. The CLI must be installed and signed in (ngrok needs an auth token) on the machine that runs localhook.
+
+| Provider | Command that runs |
+|---|---|
+| `ngrok` | `ngrok http <proxy port>` |
+| `cloudflared` | `cloudflared tunnel --url http://localhost:<proxy port>` (quick tunnel, no account) |
+| `custom` | `TUNNEL_COMMAND` (only listed when the variable is set). The first `https://` URL in its output is the public URL. Example: `TUNNEL_COMMAND="cloudflared tunnel --url http://localhost:{port}"` |
+
+#### Your own domain with cloudflared
+
+Quick tunnels get a new random URL each time. To get a fixed URL on your own domain, use a named Cloudflare tunnel. This needs a free Cloudflare account and a domain on Cloudflare.
+
+1. In Cloudflare Zero Trust, open Networks → Tunnels. Create a tunnel of type cloudflared and copy its token.
+2. Add a public hostname to the tunnel, for example `hook.example.com`. Set the service to `HTTP` and `localhost:8081` (`HOOK_PROXY_PORT`; the Receiver shows the port).
+3. In the Receiver, click the globe button next to the tunnel list. Enter the hostname and the token, and click Save and start.
+
+The token is saved in the database and is never sent back to the browser. It is given to `cloudflared` in an environment variable, not in its arguments. Use `cloudflared (own domain)` in the tunnel list to start it again later. This also works in Docker, because `cloudflared` runs in the same container.
+
+The tunnel exposes only `/hook` URLs. The UI and the API (`/api`) are not reachable through it and return 404. The Docker image includes `cloudflared` and `ngrok`. For ngrok, set `NGROK_AUTHTOKEN` in the container environment. `cloudflared` quick tunnels need no account.
 
 Set variables in the shell or in a `.env` file in the project root (see `.env.example`). Bun, Vite and Docker Compose all read it.
 
