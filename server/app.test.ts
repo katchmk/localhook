@@ -307,6 +307,8 @@ describe("signatures", () => {
 
 describe("search", () => {
   test("filters by method and by text in path, headers and body", async () => {
+    // The shared config keeps 3 requests; this test sends 4.
+    app = createApp(store, createHub(), { ...config, maxRequestsPerEndpoint: 10 });
     await createEndpoint();
     await app.request("/hook/test/a", { method: "POST", body: "needle in body" });
     await app.request("/hook/test/b", { method: "PUT", headers: { "x-tag": "Needle" } });
